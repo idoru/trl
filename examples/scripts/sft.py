@@ -19,8 +19,9 @@ import torch
 from accelerate import Accelerator
 from datasets import load_dataset
 from peft import LoraConfig
+#from peft import get_peft_model
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig, HfArgumentParser, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, HfArgumentParser, TrainingArguments
 
 from trl import SFTTrainer, is_xpu_available
 
@@ -85,7 +86,9 @@ if script_args.load_in_8bit and script_args.load_in_4bit:
     raise ValueError("You can't load the model in 8 bits and 4 bits at the same time")
 elif script_args.load_in_8bit or script_args.load_in_4bit:
     quantization_config = BitsAndBytesConfig(
-        load_in_8bit=script_args.load_in_8bit, load_in_4bit=script_args.load_in_4bit
+        load_in_8bit=script_args.load_in_8bit, load_in_4bit=script_args.load_in_4bit,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
     )
     # Copy the model to each device
     device_map = (
@@ -99,17 +102,49 @@ else:
     quantization_config = None
     torch_dtype = None
 
+device_map = (
+        {"": f"xpu:{Accelerator().local_process_index}"}
+        if is_xpu_available()
+        else {"": Accelerator().local_process_index}
+    )
 model = AutoModelForCausalLM.from_pretrained(
     script_args.model_name,
-    quantization_config=quantization_config,
+    #quantization_config=quantization_config,
     device_map=device_map,
     trust_remote_code=script_args.trust_remote_code,
-    torch_dtype=torch_dtype,
+    torch_dtype=torch.bfloat16, #torch_dtype,
     use_auth_token=script_args.use_auth_token,
+    #torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
+    attn_implementation="flash_attention_2",
 )
+
+if quantization_config is None:
+    for param in model.parameters():
+        param.requires_grad = True
+    # model.inputs.requires_grad_(True)
+    model.to("cuda")
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+
+        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+#### DEBUGGGG heree
+
+tokenizer = AutoTokenizer.from_pretrained(
+    script_args.model_name,
+    padding_side="left",
+    add_eos_token=True,
+    add_bos_token=True,
+)
+tokenizer.pad_token = tokenizer.eos_token
 
 # Step 2: Load the dataset
 dataset = load_dataset(script_args.dataset_name, split="train")
+eval_dataset = load_dataset(script_args.dataset_name, split="test")
 
 # Step 3: Define the training arguments
 training_args = TrainingArguments(
@@ -126,10 +161,18 @@ training_args = TrainingArguments(
     push_to_hub=script_args.push_to_hub,
     hub_model_id=script_args.hub_model_id,
     gradient_checkpointing=script_args.gradient_checkpointing,
+    bf16=True,
+    weight_decay=0.0,
+    max_grad_norm=0.3,
+    adam_beta2=0.999,
+    eval_steps=100,
+    lr_scheduler_type="constant",
+    do_eval=True,
     # TODO: uncomment that on the next release
     # gradient_checkpointing_kwargs=script_args.gradient_checkpointing_kwargs,
 )
 
+print(f"PeftConfig is targeting modules {script_args.target_modules}")
 # Step 4: Define the LoraConfig
 if script_args.use_peft:
     peft_config = LoraConfig(
@@ -137,8 +180,12 @@ if script_args.use_peft:
         lora_alpha=script_args.peft_lora_alpha,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=script_args.target_modules,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj","gate_proj"], #script_args.target_modules,
+        lora_dropout=0.1
     )
+    # m2 = model
+    # model = get_peft_model(model, peft_config)
+    # model.print_trainable_parameters()
 else:
     peft_config = None
 
@@ -148,8 +195,10 @@ trainer = SFTTrainer(
     args=training_args,
     max_seq_length=script_args.seq_length,
     train_dataset=dataset,
+    eval_dataset=eval_dataset,
     dataset_text_field=script_args.dataset_text_field,
     peft_config=peft_config,
+    tokenizer=tokenizer,
 )
 
 trainer.train()
