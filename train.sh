@@ -10,8 +10,8 @@ MODEL_NAME="OpenPipe/mistral-ft-optimized-1218"
 DATASET_NAME="timdettmers/openassistant-guanaco"
 DATASET_TEXT_FIELD="text"
 
-BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=16
+BATCH_SIZE=4
+GRADIENT_ACCUMULATION_STEPS=4
 GRADIENT_CHECKPOINTING=false
 
 TRAIN_EPOCHS=25
@@ -29,4 +29,5 @@ python examples/scripts/sft.py --model_name "$MODEL_NAME" \
   --gradient_checkpointing "$GRADIENT_CHECKPOINTING" \
   --batch_size "$BATCH_SIZE" \
   --peft_lora_r 64 \
-  --num_train_epochs "$TRAIN_EPOCHS"
+  --num_train_epochs "$TRAIN_EPOCHS" \
+  #--load_in_4bit

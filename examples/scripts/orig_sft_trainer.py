@@ -1,3 +1,4 @@
+# Original from https://gist.github.com/lewtun/b9d46e00292d9ecdd6fd9628d53c2814
 # This is a modified version of TRL's `SFTTrainer` example (https://github.com/huggingface/trl/blob/main/examples/scripts/sft_trainer.py), 
 # adapted to run with DeepSpeed ZeRO-3 and Mistral-7B-V1.0. The settings below were run on 1 node of 8 x A100 (80GB) GPUs.
 #
@@ -14,29 +15,14 @@ from typing import Optional
 import torch
 from accelerate import Accelerator
 from datasets import load_dataset
-from deepspeed import get_accelerator
 from peft import LoraConfig
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig, HfArgumentParser, TrainingArguments, AutoTokenizer
-from transformers import TrainerCallback
+
 from trl import SFTTrainer
 
 
 tqdm.pandas()
-
-import time
-class Flusher(TrainerCallback):
-    def on_evaluate(self, args, state, control, **kwargs):
-        #accelerator = Accelerator()
-        # if accelerator.is_main_process:
-        #     time.sleep(2)
-        # else:
-        #     print("I'm waiting for the main process to finish its sleep...")
-        # accelerator.wait_for_everyone()
-        print(f"\n\nEvaluated. State: {state}")
-        #get_accelerator().empty_cache()
-        #torch.cuda.empty_cache()
-        print("done.")
 
 
 # Define and parse arguments.
@@ -46,23 +32,21 @@ class ScriptArguments:
     The name of the Casual LM model we wish to fine with SFTTrainer
     """
 
-#    model_name: Optional[str] = field(default="mistralai/Mistral-7B-v0.1", metadata={"help": "the model name"})
-    model_name: Optional[str] = field(default="OpenPipe/mistral-ft-optimized-1227", metadata={"help": "the model name"})
-#    model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
+    model_name: Optional[str] = field(default="mistralai/Mistral-7B-v0.1", metadata={"help": "the model name"})
     dataset_name: Optional[str] = field(
         default="stingning/ultrachat", metadata={"help": "the dataset name"}
     )
     dataset_text_field: Optional[str] = field(default="text", metadata={"help": "the text field of the dataset"})
     log_with: Optional[str] = field(default="wandb", metadata={"help": "use 'wandb' to log with wandb"})
     learning_rate: Optional[float] = field(default=2.0e-5, metadata={"help": "the learning rate"})
-    batch_size: Optional[int] = field(default=1, metadata={"help": "the batch size"})
-    seq_length: Optional[int] = field(default=4096, metadata={"help": "Input sequence length"})
+    batch_size: Optional[int] = field(default=8, metadata={"help": "the batch size"})
+    seq_length: Optional[int] = field(default=1024, metadata={"help": "Input sequence length"})
     gradient_accumulation_steps: Optional[int] = field(
         default=8, metadata={"help": "the number of gradient accumulation steps"}
     )
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
     load_in_4bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 4 bits precision"})
-    use_peft: Optional[bool] = field(default=True, metadata={"help": "Wether to use PEFT or not to train adapters"})
+    use_peft: Optional[bool] = field(default=False, metadata={"help": "Wether to use PEFT or not to train adapters"})
     trust_remote_code: Optional[bool] = field(default=False, metadata={"help": "Enable `trust_remote_code`"})
     output_dir: Optional[str] = field(default="output", metadata={"help": "the output directory"})
     peft_lora_r: Optional[int] = field(default=64, metadata={"help": "the r parameter of the LoRA adapters"})
@@ -76,20 +60,15 @@ class ScriptArguments:
     )
     save_total_limit: Optional[int] = field(default=10, metadata={"help": "Limits total number of checkpoints."})
     push_to_hub: Optional[bool] = field(default=True, metadata={"help": "Push the model to HF Hub"})
-    hub_model_id: Optional[str] = field(default="mistral-ft-optimized-1227-ultrachat", metadata={"help": "The name of the model on HF Hub"})
+    hub_model_id: Optional[str] = field(default="mistral-7b-finetuned-ultrachat", metadata={"help": "The name of the model on HF Hub"})
 
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 
 # Step 1: Load the dataset
-tokenizer = AutoTokenizer.from_pretrained(script_args.model_name)#,
-#    padding_side="left",
-#    add_eos_token=True,
-#    add_bos_token=True,)
-#tokenizer.pad_token = tokenizer.eos_token
-
-dataset = load_dataset(script_args.dataset_name, split="train[:20000]")#[:20000]
+tokenizer = AutoTokenizer.from_pretrained(script_args.model_name)
+dataset = load_dataset(script_args.dataset_name, split="train[:20000]")
 dataset = dataset.train_test_split(test_size=0.1)
 
 def prepare_dialogue(example):
@@ -124,9 +103,8 @@ model = AutoModelForCausalLM.from_pretrained(
     quantization_config=quantization_config,
     device_map=device_map,
     trust_remote_code=script_args.trust_remote_code,
-    torch_dtype=torch.bfloat16,#none? originally
+    torch_dtype=torch_dtype,
     use_auth_token=script_args.use_auth_token,
-    attn_implementation="flash_attention_2"#none originally.
 )
 
 
@@ -146,14 +124,11 @@ training_args = TrainingArguments(
     push_to_hub=script_args.push_to_hub,
     hub_model_id=script_args.hub_model_id,
     bf16=True,
-    #bf16_full_eval=True, #not here originally
     lr_scheduler_type="cosine",
     warmup_ratio=0.1,
-    evaluation_strategy="steps",
-    eval_steps=10,
+    evaluation_strategy="epoch",
     logging_first_step=True,
-    optim="paged_adamw_8bit",
-    gradient_checkpointing_kwargs={ 'use_reentrant': False}
+
 )
 
 # Step 4: Define the LoraConfig
@@ -167,7 +142,7 @@ if script_args.use_peft:
 else:
     peft_config = None
 
-flusher = Flusher()
+
 # Step 5: Define the Trainer
 trainer = SFTTrainer(
     model=model,
@@ -178,10 +153,8 @@ trainer = SFTTrainer(
     dataset_text_field=script_args.dataset_text_field,
     peft_config=peft_config,
     packing=True,
-    callbacks=[flusher],
 )
 
-#trainer.train(resume_from_checkpoint=True)
 trainer.train()
 
 # Step 6: Save the model

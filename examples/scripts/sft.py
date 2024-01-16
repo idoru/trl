@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from trl import SFTTrainer, is_xpu_available
 
+accelerator = Accelerator()
 
 tqdm.pandas()
 
@@ -36,28 +37,30 @@ class ScriptArguments:
     The name of the Casual LM model we wish to fine with SFTTrainer
     """
 
-    model_name: Optional[str] = field(default="facebook/opt-350m", metadata={"help": "the model name"})
+    #model_name: Optional[str] = field(default="OpenPipe/mistral-ft-optimized-1218", metadata={"help": "the model name"})
+    model_name: Optional[str] = field(default="mistralai/Mistral-7B-v0.1", metadata={"help": "the model name"})
+    #model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
     dataset_name: Optional[str] = field(
         default="timdettmers/openassistant-guanaco", metadata={"help": "the dataset name"}
     )
     dataset_text_field: Optional[str] = field(default="text", metadata={"help": "the text field of the dataset"})
-    report_to: Optional[str] = field(default="none", metadata={"help": "use 'wandb' to log with wandb"})
-    learning_rate: Optional[float] = field(default=1.41e-5, metadata={"help": "the learning rate"})
-    batch_size: Optional[int] = field(default=64, metadata={"help": "the batch size"})
+    report_to: Optional[str] = field(default="wandb", metadata={"help": "use 'wandb' to log with wandb"})
+    learning_rate: Optional[float] = field(default=2e-4, metadata={"help": "the learning rate"}) #was 1.41e-5
+    batch_size: Optional[int] = field(default=1, metadata={"help": "the batch size"})
     seq_length: Optional[int] = field(default=512, metadata={"help": "Input sequence length"})
     gradient_accumulation_steps: Optional[int] = field(
         default=16, metadata={"help": "the number of gradient accumulation steps"}
     )
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
     load_in_4bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 4 bits precision"})
-    use_peft: Optional[bool] = field(default=False, metadata={"help": "Wether to use PEFT or not to train adapters"})
+    use_peft: Optional[bool] = field(default=True, metadata={"help": "Wether to use PEFT or not to train adapters"})
     trust_remote_code: Optional[bool] = field(default=False, metadata={"help": "Enable `trust_remote_code`"})
     output_dir: Optional[str] = field(default="output", metadata={"help": "the output directory"})
     peft_lora_r: Optional[int] = field(default=64, metadata={"help": "the r parameter of the LoRA adapters"})
     peft_lora_alpha: Optional[int] = field(default=16, metadata={"help": "the alpha parameter of the LoRA adapters"})
     logging_steps: Optional[int] = field(default=1, metadata={"help": "the number of logging steps"})
     use_auth_token: Optional[bool] = field(default=True, metadata={"help": "Use HF auth token to access the model"})
-    num_train_epochs: Optional[int] = field(default=3, metadata={"help": "the number of training epochs"})
+    num_train_epochs: Optional[int] = field(default=25, metadata={"help": "the number of training epochs"}) #was 3
     max_steps: Optional[int] = field(default=-1, metadata={"help": "the number of training steps"})
     save_steps: Optional[int] = field(
         default=100, metadata={"help": "Number of updates steps before two checkpoint saves"}
@@ -92,9 +95,9 @@ elif script_args.load_in_8bit or script_args.load_in_4bit:
     )
     # Copy the model to each device
     device_map = (
-        {"": f"xpu:{Accelerator().local_process_index}"}
+        {"": f"xpu:{accelerator.local_process_index}"}
         if is_xpu_available()
-        else {"": Accelerator().local_process_index}
+        else {"": accelerator.local_process_index}
     )
     torch_dtype = torch.bfloat16
 else:
@@ -103,27 +106,27 @@ else:
     torch_dtype = None
 
 device_map = (
-        {"": f"xpu:{Accelerator().local_process_index}"}
+        {"": f"xpu:{accelerator.local_process_index}"}
         if is_xpu_available()
-        else {"": Accelerator().local_process_index}
+        else {"": accelerator.local_process_index}
     )
 model = AutoModelForCausalLM.from_pretrained(
     script_args.model_name,
-    #quantization_config=quantization_config,
-    device_map=device_map,
+    quantization_config=quantization_config,
+    device_map=None,
     trust_remote_code=script_args.trust_remote_code,
-    torch_dtype=torch.bfloat16, #torch_dtype,
+    #torch_dtype=torch.bfloat16, #torch_dtype,
+    # torch_dtype=torch.float16,
     use_auth_token=script_args.use_auth_token,
-    #torch_dtype=torch.float16,
-    low_cpu_mem_usage=True,
-    attn_implementation="flash_attention_2",
+    #low_cpu_mem_usage=True,
+    #attn_implementation="flash_attention_2",
 )
 
 if quantization_config is None:
     for param in model.parameters():
         param.requires_grad = True
     # model.inputs.requires_grad_(True)
-    model.to("cuda")
+    #model.to("cuda")
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
     else:
@@ -136,7 +139,7 @@ if quantization_config is None:
 
 tokenizer = AutoTokenizer.from_pretrained(
     script_args.model_name,
-    padding_side="left",
+#    padding_side="left",
     add_eos_token=True,
     add_bos_token=True,
 )
@@ -169,7 +172,7 @@ training_args = TrainingArguments(
     lr_scheduler_type="constant",
     do_eval=True,
     # TODO: uncomment that on the next release
-    # gradient_checkpointing_kwargs=script_args.gradient_checkpointing_kwargs,
+    gradient_checkpointing_kwargs=script_args.gradient_checkpointing_kwargs,
 )
 
 print(f"PeftConfig is targeting modules {script_args.target_modules}")
