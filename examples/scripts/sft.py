@@ -43,10 +43,10 @@ class ScriptArguments:
     dataset_text_field: Optional[str] = field(default="text", metadata={"help": "the text field of the dataset"})
     report_to: Optional[str] = field(default="none", metadata={"help": "use 'wandb' to log with wandb"})
     learning_rate: Optional[float] = field(default=1.41e-5, metadata={"help": "the learning rate"})
-    batch_size: Optional[int] = field(default=64, metadata={"help": "the batch size"})
-    seq_length: Optional[int] = field(default=512, metadata={"help": "Input sequence length"})
+    batch_size: Optional[int] = field(default=1, metadata={"help": "the batch size"})
+    seq_length: Optional[int] = field(default=1024, metadata={"help": "Input sequence length"})
     gradient_accumulation_steps: Optional[int] = field(
-        default=16, metadata={"help": "the number of gradient accumulation steps"}
+        default=8, metadata={"help": "the number of gradient accumulation steps"}
     )
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
     load_in_4bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 4 bits precision"})
@@ -68,7 +68,7 @@ class ScriptArguments:
         default=False, metadata={"help": "Whether to use gradient checkpointing or no"}
     )
     gradient_checkpointing_kwargs: Optional[dict] = field(
-        default=None,
+        default= field(default_factory=lambda: { 'use_reentrant': False }),
         metadata={
             "help": "key word arguments to be passed along `torch.utils.checkpoint.checkpoint` method - e.g. `use_reentrant=False`"
         },
@@ -97,10 +97,13 @@ elif script_args.load_in_8bit or script_args.load_in_4bit:
         else {"": Accelerator().local_process_index}
     )
     torch_dtype = torch.bfloat16
+    print(f"Quantizing, config: {quantization_config}")
 else:
+    print("Not quantizing model")
     device_map = None
     quantization_config = None
-    torch_dtype = None
+    torch_dtype = "auto"
+print(f"torch_dtype: {torch_dtype}, device_map: {device_map}")
 
 device_map = (
         {"": f"xpu:{Accelerator().local_process_index}"}
@@ -109,36 +112,39 @@ device_map = (
     )
 model = AutoModelForCausalLM.from_pretrained(
     script_args.model_name,
-    #quantization_config=quantization_config,
+    quantization_config=quantization_config,
     device_map=device_map,
     trust_remote_code=script_args.trust_remote_code,
-    torch_dtype=torch.bfloat16, #torch_dtype,
-    use_auth_token=script_args.use_auth_token,
+    torch_dtype=torch_dtype,
+    #use_auth_token=script_args.use_auth_token,
     #torch_dtype=torch.float16,
-    low_cpu_mem_usage=True,
-    attn_implementation="flash_attention_2",
+    #low_cpu_mem_usage=True,
+    #flash_attn=True, flash_rotary=True, fused_dense=True, #phi-2
+    #gradient_checkpointing=True
+    #attn_implementation="flash_attention_2",
 )
+print(model)
+### wow this is weird. why was this here again???
+# if quantization_config is None:
+#     for param in model.parameters():
+#         param.requires_grad = True
+#     # model.inputs.requires_grad_(True)
+#     model.to("cuda")
+#     if hasattr(model, "enable_input_require_grads"):
+#         model.enable_input_require_grads()
+#     else:
+#         def make_inputs_require_grad(module, input, output):
+#             output.requires_grad_(True)
 
-if quantization_config is None:
-    for param in model.parameters():
-        param.requires_grad = True
-    # model.inputs.requires_grad_(True)
-    model.to("cuda")
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-    else:
-        def make_inputs_require_grad(module, input, output):
-            output.requires_grad_(True)
-
-        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+#         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
 #### DEBUGGGG heree
 
 tokenizer = AutoTokenizer.from_pretrained(
     script_args.model_name,
-    padding_side="left",
-    add_eos_token=True,
-    add_bos_token=True,
+#    padding_side="left",
+#    add_eos_token=True,
+#    add_bos_token=True,
 )
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -165,6 +171,8 @@ training_args = TrainingArguments(
     weight_decay=0.0,
     max_grad_norm=0.3,
     adam_beta2=0.999,
+    optim="paged_adamw_8bit",
+    evaluation_strategy="steps",
     eval_steps=100,
     lr_scheduler_type="constant",
     do_eval=True,
@@ -172,7 +180,12 @@ training_args = TrainingArguments(
     # gradient_checkpointing_kwargs=script_args.gradient_checkpointing_kwargs,
 )
 
-print(f"PeftConfig is targeting modules {script_args.target_modules}")
+target_modules = script_args.target_modules
+#target_modules=["q_proj", "k_proj", "v_proj", "o_proj","gate_proj"] #mistral #script_args.target_modules
+target_modules = ['Wqkv', 'out_proj'] #phi-2
+#target_modules = ['fc1', 'fc2', 'Wqkv', 'out_proj'] #phi-2 more
+
+print(f"PeftConfig is targeting modules {target_modules}")
 # Step 4: Define the LoraConfig
 if script_args.use_peft:
     peft_config = LoraConfig(
@@ -180,8 +193,8 @@ if script_args.use_peft:
         lora_alpha=script_args.peft_lora_alpha,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj","gate_proj"], #script_args.target_modules,
-        lora_dropout=0.1
+        target_modules = target_modules,
+        lora_dropout=0.05
     )
     # m2 = model
     # model = get_peft_model(model, peft_config)

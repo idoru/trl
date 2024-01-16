@@ -41,9 +41,9 @@ class ScriptArguments:
     # training parameters
     model_name_or_path: Optional[str] = field(default="gpt2", metadata={"help": "the model name"})
     learning_rate: Optional[float] = field(default=1e-3, metadata={"help": "optimizer learning rate"})
-    per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "batch size per device"})
+    per_device_train_batch_size: Optional[int] = field(default=1, metadata={"help": "batch size per device"})
     gradient_accumulation_steps: Optional[int] = field(
-        default=1, metadata={"help": "the number of gradient accumulation steps"}
+        default=4, metadata={"help": "the number of gradient accumulation steps"}
     )
     max_length: Optional[int] = field(default=512, metadata={"help": "max length of each sample"})
     max_prompt_length: Optional[int] = field(default=128, metadata={"help": "max length of each sample's prompt"})
@@ -58,6 +58,7 @@ class ScriptArguments:
     peft_lora_alpha: Optional[int] = field(default=16, metadata={"help": "the alpha parameter of the LoRA adapters"})
     # instrumentation
     sanity_check: Optional[bool] = field(default=True, metadata={"help": "only train on 1000 samples"})
+    trust_remote_code: Optional[bool] = field(default=False, metadata={"help": "Enable `trust_remote_code`"})
     report_to: Optional[str] = field(
         default=None,
         metadata={
@@ -127,7 +128,7 @@ if __name__ == "__main__":
     script_args = parser.parse_args_into_dataclasses()[0]
 
     # 1. load a pretrained model
-    model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
+    model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path, torch_dtype="auto", trust_remote_code=script_args.trust_remote_code)
 
     if script_args.ignore_bias_buffers:
         # torch distributed hack
@@ -135,7 +136,7 @@ if __name__ == "__main__":
             name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
         ]
 
-    model_ref = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
+    model_ref = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path, torch_dtype="auto", trust_remote_code=script_args.trust_remote_code)
 
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path)
     if tokenizer.pad_token is None:
@@ -160,20 +161,31 @@ if __name__ == "__main__":
         eval_steps=500,
         output_dir="./test",
         optim="rmsprop",
+# weight_decay=0.0,
+#     max_grad_norm=0.3,
+#     adam_beta2=0.999,
+
         warmup_steps=150,
         report_to=script_args.report_to,
-        bf16=True,
+        bf16=False,
+        # fp16=True,
         gradient_checkpointing=script_args.gradient_checkpointing,
         # TODO: uncomment that on the next transformers release
-        # gradient_checkpointing_kwargs=script_args.gradient_checkpointing_kwargs,
+        gradient_checkpointing_kwargs=script_args.gradient_checkpointing_kwargs,
     )
 
     if script_args.use_peft:
+        #As per https://medium.com/@geronimo7/phinetuning-2-0-28a2be6de110
+        # for phi-2, target modules ['Wqkv','out_proj'] minimally
+        # also possible to train ['fc1', 'fc2', 'Wqkv', 'out_proj']
         peft_config = LoraConfig(
             r=script_args.peft_lora_r,
             lora_alpha=script_args.peft_lora_alpha,
             bias="none",
             task_type="CAUSAL_LM",
+            #target_modules=["q_proj", "k_proj", "v_proj", "o_proj","gate_proj"], #mistral,
+            lora_dropout=0.1,
+            target_modules = ['Wqkv', 'out_proj'],#phi-2
         )
     else:
         peft_config = None
