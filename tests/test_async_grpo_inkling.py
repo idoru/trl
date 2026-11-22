@@ -145,6 +145,33 @@ def test_inkling_tree_mask_at_block_boundaries():
             assert required <= allowed
 
 
+def test_inkling_mask_at_reference_token_budget():
+    from trl.experimental.async_grpo.inkling_tree import InklingTree
+
+    # Two 16k continuations share a 32k prefix. This is one complete reference-sized row.
+    n, fork = 65_536, 32_768
+    midpoint = fork + (n - fork) // 2
+    positions = torch.cat((torch.arange(midpoint), torch.arange(fork, midpoint)))[None]
+    kv = torch.cat((torch.arange(fork), torch.arange(midpoint), torch.arange(fork), torch.arange(midpoint, n)))
+    layout = InklingTree(
+        positions,
+        {
+            "tree_cu_seqlens_q": torch.tensor([0, fork, midpoint, n]),
+            "tree_cu_seqlens_k": torch.tensor([0, fork, fork + midpoint, len(kv)]),
+            "tree_segment_parents": torch.tensor([-1, 0, 0]),
+            "tree_kv_index": kv,
+        },
+        kernel_size=4,
+    )
+    full, sliding = layout.block_mask(None), layout.block_mask(1024)
+    query = torch.tensor([n - 1] * 5)
+    keys = torch.tensor([fork - 1, midpoint - 1, n - 1024, n - 1025, n])
+    assert full.mask_mod(0, 0, query, keys).tolist() == [True, False, True, True, True]
+    assert sliding.mask_mod(0, 0, query, keys).tolist() == [False, False, True, False, True]
+    assert full.kv_indices.numel() == (n // 128) * (n // 128 + 1)
+    assert layout.with_halos.numel() == n + 3 * 3
+
+
 def test_inkling_async_grpo_loss(tmp_path, monkeypatch):
     from datasets import Dataset
     from tokenizers import Tokenizer
