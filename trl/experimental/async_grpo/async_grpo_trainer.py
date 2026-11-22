@@ -1007,6 +1007,11 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         text_config = model.config.get_text_config()
         layer_types = set(getattr(text_config, "layer_types", None) or []) - {"full_attention", "sliding_attention"}
+        if text_config.model_type == "inkling2_loop_text":
+            from .inkling_tree import install_inkling_tree
+
+            install_inkling_tree(model)
+            layer_types -= {"hybrid", "hybrid_sliding"}
         # Check tree attention compat
         if layer_types:
             if layer_types == {"linear_attention"} and Version(transformers.__version__) < Version("5.15.0"):
