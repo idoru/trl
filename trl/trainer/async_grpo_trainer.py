@@ -3051,6 +3051,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
             raise NotImplementedError("`use_liger_kernel` is not supported yet.")
 
         text_config = model.config.get_text_config()
+        if text_config.model_type == "inkling2_loop_text":
+            from .inkling_tree import install_inkling_tree
+
+            install_inkling_tree(model)
         layer_types = set(getattr(text_config, "layer_types", None) or []) - {
             "full_attention",
             "sliding_attention",
@@ -3058,6 +3062,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
             "mlp",
         }
         # Check tree attention compat
+        if text_config.model_type == "inkling2_loop_text":
+            layer_types -= {"hybrid", "hybrid_sliding"}
         if layer_types not in (set(), {"linear_attention"}, {"conv"}):
             raise ValueError(
                 f"{type(model).__name__} has {sorted(layer_types)} layers. Tree packing routes attention, "
