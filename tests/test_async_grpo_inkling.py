@@ -22,7 +22,7 @@ import torch
 from trl.experimental.async_grpo.packing import TreeRow, unpad_tree
 
 
-def make_model(head_dim=16):
+def make_model(head_dim=16, hidden_size=32, moe_intermediate_size=24):
     pytest.importorskip("transformers.models.inkling2_loop")
     from transformers import Inkling2LoopForCausalLM, Inkling2LoopTextConfig
 
@@ -30,7 +30,7 @@ def make_model(head_dim=16):
         vocab_size=64,
         unpadded_vocab_size=64,
         eos_token_id=63,
-        hidden_size=32,
+        hidden_size=hidden_size,
         num_hidden_layers=8,
         layer_types=["hybrid_sliding", "hybrid"] * 4,
         n_layers_per_attn_res_block=2,
@@ -47,7 +47,7 @@ def make_model(head_dim=16):
         sliding_window_size=4,
         rel_extent=6,
         d_rel=4,
-        moe_intermediate_size=24,
+        moe_intermediate_size=moe_intermediate_size,
         n_routed_experts=4,
         num_experts_per_tok=2,
         conv_kernel_size=4,
@@ -172,8 +172,12 @@ def test_inkling_mask_at_reference_token_budget():
     assert layout.with_halos.numel() == n + 3 * 3
 
 
-def test_inkling_async_grpo_loss(tmp_path, monkeypatch):
+@pytest.mark.parametrize("recipe_lora", [False, True], ids=["base", "recipe-lora"])
+def test_inkling_async_grpo_loss(tmp_path, monkeypatch, recipe_lora):
+    from unittest.mock import Mock
+
     from datasets import Dataset
+    from peft import LoraConfig
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from transformers import PreTrainedTokenizerFast
@@ -187,6 +191,12 @@ def test_inkling_async_grpo_loss(tmp_path, monkeypatch):
     # The real trainer's throughput logger probes a CUDA device even in CPU mode.
     monkeypatch.setattr(async_grpo_trainer, "get_peak_flops_per_device", lambda accelerator, dtype: None)
     # This fixture supplies the sampler's measured probabilities directly. It starts no external vLLM server.
+    remote = Mock()
+    remote.get_server_info.return_value = {
+        "lora_config": {"max_lora_rank": 32, "max_loras": 18},
+        "parallel_config": {"data_parallel_size": 1},
+    }
+    monkeypatch.setattr(async_grpo_trainer, "VLLMClient", lambda *args: remote)
     monkeypatch.setattr(async_grpo_trainer, "WeightTransferClient", lambda **kwargs: None)
     monkeypatch.setattr(
         async_grpo_trainer, "AsyncRolloutWorker", lambda *args, **kwargs: SimpleNamespace(rollout_buffer=[])
@@ -204,6 +214,7 @@ def test_inkling_async_grpo_loss(tmp_path, monkeypatch):
         report_to="none",
         max_steps=1,
         temperature=0.8,
+        learning_rate=2e-5,
         score_centering=True,
         gradient_checkpointing=False,
     )
@@ -244,7 +255,22 @@ def test_inkling_async_grpo_loss(tmp_path, monkeypatch):
         processing_class=processor,
         harness_session_factory=fixture_session,
         train_dataset=Dataset.from_dict({"prompt": ["1", "2"]}),
+        peft_config=LoraConfig(
+            r=32,
+            lora_alpha=64,
+            task_type="CAUSAL_LM",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        )
+        if recipe_lora
+        else None,
     )
+    if recipe_lora:
+        # PEFT starts with zero B. Exercise both gradient paths with a nonzero version of the adapter.
+        assert trainer._lora_sync
+        with torch.no_grad():
+            for name, param in trainer.model.named_parameters():
+                if ".lora_B." in name:
+                    param.normal_(0, 0.01)
     # Trainer.train sets this for each group of accumulated microbatches before calling compute_loss.
     trainer.current_gradient_accumulation_steps = args.gradient_accumulation_steps
     collator = DataCollatorForRollout(pad_token_id=0)
@@ -269,3 +295,14 @@ def test_inkling_async_grpo_loss(tmp_path, monkeypatch):
             torch.testing.assert_close(
                 packed_grads[name], p.grad, rtol=2e-4, atol=2e-6, msg=lambda s, n=name: f"{n}: {s}"
             )
+    if recipe_lora:
+        roles = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+        assert all(any(f".{role}." in n and g.abs().max() > 0 for n, g in packed_grads.items()) for role in roles)
+        assert all("lora_" in n for n in packed_grads)
+        trainer.model.zero_grad(set_to_none=True)
+        loss(samples)[0].backward()
+        optimizer = trainer.create_optimizer()
+        selected = next(p for p in trainer.model.parameters() if p.grad is not None and p.grad.abs().max() > 0)
+        before = selected.detach().clone()
+        optimizer.step()
+        assert not torch.equal(before, selected)

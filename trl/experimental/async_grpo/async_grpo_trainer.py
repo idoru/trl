@@ -624,6 +624,16 @@ def round_lora_rank(adapter_rank: int) -> int:
     )
 
 
+def _inkling_serving_export(model, config):
+    if not isinstance(config, LoraConfig) or not config.target_parameters:
+        return False
+    if model.config.get_text_config().model_type != "inkling2_loop_text":
+        return False
+    from .inkling_lora import is_inkling_recipe_lora
+
+    return is_inkling_recipe_lora(config)
+
+
 def validate_lora_for_vllm_sync(model: "PeftModel") -> "LoraConfig":
     """
     Return the active adapter's config, checking it can be served as a plain vLLM LoRA adapter.
@@ -668,7 +678,7 @@ def validate_lora_for_vllm_sync(model: "PeftModel") -> "LoraConfig":
             f"`bias='{peft_config.bias}'` trains bias terms, which are not part of a LoRA adapter and would be "
             f"dropped on the way to vLLM. Use `bias='none'`, or sync merged weights instead."
         )
-    if peft_config.target_parameters:
+    if peft_config.target_parameters and not _inkling_serving_export(model, peft_config):
         raise ValueError(
             f"`target_parameters={peft_config.target_parameters}` (fused-MoE parameter LoRA) needs the adapter to be "
             f"declared with `is_3d_lora_weight=True` against a server started with "
@@ -728,10 +738,17 @@ def save_lora_adapter(model: "PeftModel", accelerator: Accelerator, adapter_name
     tmp_dir = os.path.join(os.path.dirname(dest_dir), f".{os.path.basename(dest_dir)}.tmp")
     shutil.rmtree(tmp_dir, ignore_errors=True)
     os.makedirs(tmp_dir, exist_ok=True)
-    model.save_pretrained(tmp_dir, selected_adapters=[adapter_name], state_dict=materialized, safe_serialization=True)
-    # PEFT nests every adapter but `"default"` in a subdirectory, while vLLM expects `adapter_config.json` at the root
-    # of the path it is handed.
-    saved_dir = tmp_dir if adapter_name == "default" else os.path.join(tmp_dir, adapter_name)
+    if _inkling_serving_export(model, model.peft_config[adapter_name]):
+        from .inkling_lora import save_inkling_serving_adapter
+
+        save_inkling_serving_adapter(model, materialized, adapter_name, tmp_dir)
+        saved_dir = tmp_dir
+    else:
+        model.save_pretrained(
+            tmp_dir, selected_adapters=[adapter_name], state_dict=materialized, safe_serialization=True
+        )
+        # PEFT nests a non-default adapter under its name. vLLM expects adapter_config.json at the root.
+        saved_dir = tmp_dir if adapter_name == "default" else os.path.join(tmp_dir, adapter_name)
     shutil.rmtree(dest_dir, ignore_errors=True)
     os.rename(saved_dir, dest_dir)  # atomic within one filesystem
     shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -761,6 +778,12 @@ def select_adapter_sync(server_info: dict, model: "PeftModel", args: AsyncGRPOCo
     """
     # `lora_config` is `None` unless the server was started with `--enable-lora`, making it the capability probe.
     server_lora_config = server_info["lora_config"]
+    inkling_export = len(model.active_adapters) == 1 and _inkling_serving_export(
+        model, model.peft_config[model.active_adapters[0]]
+    )
+    if inkling_export and (not server_lora_config or server_info["parallel_config"]["data_parallel_size"] != 1):
+        # A merged send would address split training banks with names absent from the serving model.
+        raise ValueError("Inkling's split experts require versioned adapter sync on one LoRA-enabled serving replica.")
     if server_lora_config is None:
         logger.warning(
             "Training a PEFT model against a vLLM server started without `--enable-lora`: every weight sync has "
@@ -782,6 +805,8 @@ def select_adapter_sync(server_info: dict, model: "PeftModel", args: AsyncGRPOCo
     try:
         peft_config = validate_lora_for_vllm_sync(model)
     except ValueError as error:
+        if inkling_export:
+            raise
         logger.warning(f"Falling back to merged-weight vLLM sync. {error}")
         return False
 
@@ -1101,6 +1126,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 )
             # Unlike `GRPOTrainer`, no `autocast_adapter_dtype=False` branch (it works around a DeepSpeed ZeRO-3
             # dtype mismatch, and AsyncGRPO is FSDP2-only) and no "ref" adapter (there is no reference model).
+            if text_config.model_type == "inkling2_loop_text":
+                from .inkling_lora import prepare_inkling_recipe_lora
+
+                peft_config = prepare_inkling_recipe_lora(model, peft_config)
             model = get_peft_model(model, peft_config)
 
         # `add_fused_lm_head` computes logits from `lm_head.weight` directly. On a PEFT-wrapped head that is the
