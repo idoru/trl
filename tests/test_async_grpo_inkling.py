@@ -21,7 +21,7 @@ import torch
 from trl.trainer.async_grpo_trainer import TreeRow, unpad_tree
 
 
-def make_model():
+def make_model(head_dim=16):
     pytest.importorskip("transformers.models.inkling2_loop")
     from transformers import Inkling2LoopForCausalLM, Inkling2LoopTextConfig
 
@@ -39,10 +39,10 @@ def make_model():
         loop_gate_rank=8,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=8,
+        head_dim=head_dim,
         swa_num_attention_heads=4,
         swa_num_key_value_heads=2,
-        swa_head_dim=8,
+        swa_head_dim=head_dim,
         sliding_window_size=4,
         rel_extent=6,
         d_rel=4,
@@ -90,7 +90,8 @@ def test_inkling_packed_logits_and_gradients(device):
     torch.manual_seed(17)
     torch.set_num_threads(1)
     branches = [[1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 9], [1, 2, 12], [31, 32, 33, 34], [1, 2, 12]]
-    model = make_model().to(device)
+    # Exercise the released checkpoint's head dimension on the compiled CUDA path.
+    model = make_model(head_dim=128 if device == "cuda" else 16).to(device)
     if device == "cuda":
         model.to(torch.bfloat16)
         for name, parameter in model.named_parameters():
